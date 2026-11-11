@@ -1,0 +1,304 @@
+name: README auto-update
+
+# Once a week, go over every repository you own, let Claude compare the README
+# with the code, and open a pull request where the README is out of date.
+#
+# Required secrets (Settings -> Secrets and variables -> Actions):
+#   REPOS_TOKEN              Personal access token that can read your repos and
+#                            push a branch / open a PR in them (see README).
+#   ANTHROPIC_API_KEY        Claude API key, or
+#   CLAUDE_CODE_OAUTH_TOKEN  a Claude subscription token from `claude setup-token`.
+#
+# Optional repository variables:
+#   CLAUDE_MODEL             Model to use (default: claude-opus-5-5).
+#   EXCLUDE_REPOS            Comma-separated repos to skip (owner/name or name).
+
+on:
+  schedule:
+    - cron: "17 5 * * 1" # Mondays 05:17 UTC
+  workflow_dispatch:
+    inputs:
+      repos:
+        description: "Only these repos (comma-separated owner/name or name). Empty = all repos you own."
+        required: false
+        default: ""
+      lookback_days:
+        description: "Only repos pushed to in the last N days. 0 = every repo regardless of activity."
+        required: false
+        default: "8"
+      dry_run:
+        description: "Show the proposed README diff in the run summary; don't push or open PRs."
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: readme-autoupdate
+  cancel-in-progress: false
+
+env:
+  # Branch the proposed README change is pushed to in each repository.
+  UPDATE_BRANCH: readme-autoupdate
+  PR_TITLE: "docs: update README to match the current code"
+
+jobs:
+  discover:
+    name: Find repositories
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.list.outputs.matrix }}
+      count: ${{ steps.list.outputs.count }}
+    steps:
+      - name: Check secrets
+        env:
+          REPOS_TOKEN: ${{ secrets.REPOS_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          ok=true
+          if [ -z "$REPOS_TOKEN" ]; then
+            echo "::error::Secret REPOS_TOKEN is not set."
+            ok=false
+          fi
+          if [ -z "$ANTHROPIC_API_KEY" ] && [ -z "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
+            echo "::error::Set either the ANTHROPIC_API_KEY or the CLAUDE_CODE_OAUTH_TOKEN secret."
+            ok=false
+          fi
+          "$ok"
+
+      - name: List repositories
+        id: list
+        env:
+          GH_TOKEN: ${{ secrets.REPOS_TOKEN }}
+          ONLY_REPOS: ${{ inputs.repos }}
+          LOOKBACK_DAYS: ${{ inputs.lookback_days || '8' }}
+          EXCLUDE_REPOS: ${{ vars.EXCLUDE_REPOS }}
+        run: |
+          set -euo pipefail
+
+          case "$LOOKBACK_DAYS" in
+            ''|*[!0-9]*) echo "::error::lookback_days must be a whole number."; exit 1 ;;
+          esac
+          cutoff=0
+          if [ "$LOOKBACK_DAYS" -gt 0 ]; then
+            cutoff=$(( $(date +%s) - LOOKBACK_DAYS * 86400 ))
+          fi
+
+          # Repos you own that are not forks, archived, disabled or empty
+          # (size 0), not excluded, and not opted out with the
+          # `no-readme-autoupdate` topic. Unless specific repos were asked for,
+          # only those pushed to since the cutoff are kept.
+          gh api --paginate "/user/repos?affiliation=owner&per_page=100" |
+            jq -cs \
+              --arg only "$ONLY_REPOS" \
+              --arg exclude "$EXCLUDE_REPOS" \
+              --argjson cutoff "$cutoff" '
+              def names: ascii_downcase | [splits("[,\\s]+")] | map(select(length > 0));
+              def listed($l):
+                (.full_name | ascii_downcase) as $full
+                | (.name | ascii_downcase) as $short
+                | any($l[]; . == $full or . == $short);
+              ($only | names) as $only
+              | ($exclude | names) as $exclude
+              | (add // [])
+              | map(
+                  select((.fork or .archived or .disabled) | not)
+                  | select(.size > 0)
+                  | select((.topics // []) | index("no-readme-autoupdate") | not)
+                  | select(listed($exclude) | not)
+                  | select(
+                      if ($only | length) > 0 then listed($only)
+                      else (.pushed_at | fromdateiso8601) >= $cutoff
+                      end
+                    )
+                  | {repo: .full_name, branch: .default_branch}
+                )
+            ' > repos.json
+
+          count=$(jq 'length' repos.json)
+          if [ "$count" -gt 256 ]; then
+            echo "::warning::$count repositories matched; only the first 256 are processed (GitHub matrix limit)."
+            jq -c '.[:256]' repos.json > repos.tmp && mv repos.tmp repos.json
+            count=256
+          fi
+
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "matrix=$(jq -c '{include: .}' repos.json)" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Repositories to check: $count"
+            jq -r '.[] | "- `\(.repo)` (`\(.branch)`)"' repos.json
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  update:
+    name: ${{ matrix.repo }}
+    needs: discover
+    if: needs.discover.outputs.count != '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
+    env:
+      REPO: ${{ matrix.repo }}
+      DEFAULT_BRANCH: ${{ matrix.branch }}
+    steps:
+      - name: Check out the prompt
+        uses: actions/checkout@v6
+        with:
+          path: automation
+          sparse-checkout: prompt.md
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Check out ${{ matrix.repo }}
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ matrix.repo }}
+          ref: ${{ matrix.branch }}
+          token: ${{ secrets.REPOS_TOKEN }}
+          path: target
+          # Keep the token out of the checkout Claude reads.
+          persist-credentials: false
+
+      - name: Locate README and check for a pending proposal
+        id: prep
+        working-directory: target
+        env:
+          GH_TOKEN: ${{ secrets.REPOS_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # Same lookup order GitHub uses to pick the README it displays.
+          readme=""
+          for dir in .github . docs; do
+            [ -d "$dir" ] || continue
+            match=$(find "$dir" -maxdepth 1 -type f -iname 'readme.md' | LC_ALL=C sort | head -n 1)
+            if [ -z "$match" ]; then
+              match=$(find "$dir" -maxdepth 1 -type f -iname 'readme*' | LC_ALL=C sort | head -n 1)
+            fi
+            if [ -n "$match" ]; then
+              readme="${match#./}"
+              break
+            fi
+          done
+          readme="${readme:-README.md}"
+          case "$readme" in
+            *[!A-Za-z0-9._/-]*) echo "::error::Unsupported README file name: $readme"; exit 1 ;;
+          esac
+          echo "readme=$readme" >> "$GITHUB_OUTPUT"
+
+          # If the update branch already contains the current default-branch
+          # commit, a proposal for this exact code is open (or was closed by
+          # the owner). Don't redo it until the default branch moves.
+          gh auth setup-git
+          skip=false
+          if git ls-remote --exit-code --heads origin "$UPDATE_BRANCH" >/dev/null 2>&1; then
+            git fetch --quiet --depth=50 origin "$UPDATE_BRANCH"
+            if git merge-base --is-ancestor HEAD FETCH_HEAD 2>/dev/null; then
+              skip=true
+              echo "⏭️ \`$REPO\`: a README proposal for the current \`$DEFAULT_BRANCH\` already exists on \`$UPDATE_BRANCH\`." >> "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
+          echo "skip=$skip" >> "$GITHUB_OUTPUT"
+
+      - name: Install Claude Code
+        if: steps.prep.outputs.skip != 'true'
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Let Claude review the code and update the README
+        if: steps.prep.outputs.skip != 'true'
+        working-directory: target
+        env:
+          # The only credentials this step can see are Claude's own.
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          CLAUDE_MODEL: ${{ vars.CLAUDE_MODEL || 'claude-opus-5-5' }}
+          README_PATH: ${{ steps.prep.outputs.readme }}
+        run: |
+          set -euo pipefail
+          [ -n "${ANTHROPIC_API_KEY:-}" ] || unset ANTHROPIC_API_KEY
+          [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] || unset CLAUDE_CODE_OAUTH_TOKEN
+
+          # Claude gets file reading/searching plus edits to the README and
+          # nothing else: no shell, no network tools, no MCP servers, and none
+          # of the target repository's own Claude settings or hooks.
+          sed "s|{{README_PATH}}|$README_PATH|g" "$GITHUB_WORKSPACE/automation/prompt.md" |
+            claude -p \
+              --restricted \
+              --strict-mcp-config \
+              --tools "Read,Glob,Grep,Edit,Write" \
+              --allowedTools "Edit(/$README_PATH)" \
+              --permission-mode dontAsk \
+              --model "$CLAUDE_MODEL" \
+              --output-format json > "$RUNNER_TEMP/claude.json"
+
+          jq -e '.is_error != true' "$RUNNER_TEMP/claude.json" >/dev/null || {
+            echo "::error::Claude reported an error: $(jq -r '.result // "unknown"' "$RUNNER_TEMP/claude.json")"
+            exit 1
+          }
+          jq -r '.result // ""' "$RUNNER_TEMP/claude.json" | head -c 60000 > "$RUNNER_TEMP/summary.md"
+          echo "Cost of this run: \$$(jq -r '.total_cost_usd // "n/a"' "$RUNNER_TEMP/claude.json")"
+
+      - name: Open or update the pull request
+        if: steps.prep.outputs.skip != 'true'
+        working-directory: target
+        env:
+          GH_TOKEN: ${{ secrets.REPOS_TOKEN }}
+          README_PATH: ${{ steps.prep.outputs.readme }}
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+        run: |
+          set -euo pipefail
+
+          # Only the README is ever staged, whatever else may have changed.
+          git add -- "$README_PATH" 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "✅ \`$REPO\`: README is up to date." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [ "$DRY_RUN" = "true" ]; then
+            {
+              echo "### 📝 \`$REPO\`: proposed change to \`$README_PATH\` (dry run)"
+              echo
+              cat "$RUNNER_TEMP/summary.md"
+              echo
+              echo '````diff'
+              git diff --cached
+              echo '````'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout --quiet -B "$UPDATE_BRANCH"
+          git commit --quiet -m "$PR_TITLE"
+          gh auth setup-git
+          # The branch belongs to this workflow; each run replaces it with one
+          # commit on top of the current default branch.
+          git push --quiet --force origin "$UPDATE_BRANCH"
+
+          {
+            cat "$RUNNER_TEMP/summary.md"
+            echo
+            echo "---"
+            echo "_Proposed automatically by the weekly README auto-update workflow. Review before merging. Closing this PR declines it; a new one is only proposed after \`$DEFAULT_BRANCH\` changes._"
+          } > "$RUNNER_TEMP/pr-body.md"
+
+          pr=$(gh api -X GET "repos/$REPO/pulls" \
+            -f state=open -f head="${REPO%%/*}:$UPDATE_BRANCH" -f base="$DEFAULT_BRANCH" \
+            --jq '.[0].number // empty')
+          if [ -n "$pr" ]; then
+            url=$(gh api -X PATCH "repos/$REPO/pulls/$pr" \
+              -F body=@"$RUNNER_TEMP/pr-body.md" --jq '.html_url')
+            echo "📝 \`$REPO\`: updated $url" >> "$GITHUB_STEP_SUMMARY"
+          else
+            url=$(gh api -X POST "repos/$REPO/pulls" \
+              -f title="$PR_TITLE" -f head="$UPDATE_BRANCH" -f base="$DEFAULT_BRANCH" \
+              -F body=@"$RUNNER_TEMP/pr-body.md" --jq '.html_url')
+            echo "📝 \`$REPO\`: opened $url" >> "$GITHUB_STEP_SUMMARY"
+          fi
