@@ -1,0 +1,383 @@
+name: Portfolio auto-update
+
+# Once a week, compare the public portfolio page with the READMEs of the
+# repositories you own. Where a README changed, or a repository is new, let
+# Claude update the page and open a pull request in the portfolio repository.
+# In a week where no README changed, Claude is not run and nothing is spent.
+#
+# Uses the same secrets as the README auto-update:
+#   REPOS_TOKEN              Reads your repos; pushes a branch and opens a PR
+#                            in the portfolio repository.
+#   ANTHROPIC_API_KEY        Claude API key, or
+#   CLAUDE_CODE_OAUTH_TOKEN  a Claude subscription token from `claude setup-token`.
+#
+# Optional repository variables:
+#   PORTFOLIO_REPO            Repository that holds the page
+#                             (default: <you>/portfolio-html).
+#   PORTFOLIO_PAGE            Path of the page in it (default: docs/index.html).
+#   PORTFOLIO_PRIVATE_REPOS   Private repos that may be described on the public
+#                             page (default: readme-autoupdate; `none` for none).
+#   PORTFOLIO_EXCLUDE_REPOS   Repos that never appear (default: test).
+#   PORTFOLIO_MAX_BUDGET_USD  Most one run may spend on Claude (default: 3).
+#   CLAUDE_MODEL              Model to use (default: claude-opus-5-5).
+
+on:
+  schedule:
+    - cron: "47 6 * * 1" # Mondays 06:47 UTC, after the README auto-update
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Recheck every project, even if no README changed."
+        type: boolean
+        default: false
+      dry_run:
+        description: "Show the proposed change in the run summary; don't push or open a PR."
+        type: boolean
+        default: false
+      plan_only:
+        description: "Only list what would be checked. Claude is not run and nothing is spent."
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: portfolio-autoupdate
+  cancel-in-progress: false
+
+env:
+  PORTFOLIO_REPO: ${{ vars.PORTFOLIO_REPO || format('{0}/portfolio-html', github.repository_owner) }}
+  PORTFOLIO_PAGE: ${{ vars.PORTFOLIO_PAGE || 'docs/index.html' }}
+  # Branch the proposed change is pushed to in the portfolio repository.
+  UPDATE_BRANCH: portfolio-autoupdate
+  # Records which README versions the page was last checked against.
+  STATE_FILE: .portfolio-sources.json
+  # Where the repositories Claude reads are put, inside the portfolio checkout.
+  SOURCES_DIR: portfolio-sources
+  PR_TITLE: "Update the portfolio from the repositories' READMEs"
+
+jobs:
+  update:
+    name: Update the portfolio
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check secrets and settings
+        env:
+          REPOS_TOKEN: ${{ secrets.REPOS_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          ok=true
+          if [ -z "$REPOS_TOKEN" ]; then
+            echo "::error::Secret REPOS_TOKEN is not set."
+            ok=false
+          fi
+          if [ -z "$ANTHROPIC_API_KEY" ] && [ -z "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
+            echo "::error::Set either the ANTHROPIC_API_KEY or the CLAUDE_CODE_OAUTH_TOKEN secret."
+            ok=false
+          fi
+          case "$PORTFOLIO_REPO" in
+            *[!A-Za-z0-9._/-]*|*/*/*|/*|*/) echo "::error::PORTFOLIO_REPO must be owner/name."; ok=false ;;
+            */*) ;;
+            *) echo "::error::PORTFOLIO_REPO must be owner/name."; ok=false ;;
+          esac
+          case "$PORTFOLIO_PAGE" in
+            ''|*[!A-Za-z0-9._/-]*|/*|*..*) echo "::error::Unsupported PORTFOLIO_PAGE: $PORTFOLIO_PAGE"; ok=false ;;
+          esac
+          "$ok"
+
+      - name: Check out the automation
+        uses: actions/checkout@v6
+        with:
+          path: automation
+          sparse-checkout: portfolio
+          persist-credentials: false
+
+      - name: Check out the portfolio
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.PORTFOLIO_REPO }}
+          token: ${{ secrets.REPOS_TOKEN }}
+          path: site
+          # Keep the token out of the checkout Claude reads.
+          persist-credentials: false
+
+      - name: Find what changed
+        id: plan
+        env:
+          GH_TOKEN: ${{ secrets.REPOS_TOKEN }}
+          PRIVATE_REPOS: ${{ vars.PORTFOLIO_PRIVATE_REPOS || 'readme-autoupdate' }}
+          EXCLUDE_REPOS: ${{ vars.PORTFOLIO_EXCLUDE_REPOS || 'test' }}
+          FORCE: ${{ inputs.force || 'false' }}
+          PLAN_ONLY: ${{ inputs.plan_only || 'false' }}
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/portfolio"
+          mkdir -p "$work"
+
+          if [ ! -f "site/$PORTFOLIO_PAGE" ]; then
+            echo "::error::$PORTFOLIO_PAGE was not found in $PORTFOLIO_REPO."
+            exit 1
+          fi
+          if [ -e "site/$SOURCES_DIR" ]; then
+            echo "::error::$PORTFOLIO_REPO already has a $SOURCES_DIR entry; the workflow needs that name."
+            exit 1
+          fi
+          base=$(gh api "repos/$PORTFOLIO_REPO" --jq '.default_branch')
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+
+          # Repositories that may appear on the page: yours, not forks, not
+          # archived, not empty, not excluded, without the `no-portfolio`
+          # topic. Private ones only when named in PORTFOLIO_PRIVATE_REPOS.
+          gh api --paginate "/user/repos?affiliation=owner&per_page=100" |
+            jq -s 'add // []' > "$work/repos.json"
+          python3 automation/portfolio/plan.py candidates \
+            --repos "$work/repos.json" \
+            --portfolio-repo "$PORTFOLIO_REPO" \
+            --exclude "$EXCLUDE_REPOS" \
+            --private "$PRIVATE_REPOS" > "$work/candidates.json"
+
+          # Which version of its README each one has now. Only a clear
+          # "no README" (404) is accepted as an answer; any other failure
+          # stops the run, so an API hiccup never looks like a removed project.
+          echo '{}' > "$work/readmes.json"
+          while IFS= read -r repo; do
+            if meta=$(gh api "repos/$repo/readme" --jq '{path, sha}' 2> "$work/err"); then
+              :
+            elif grep -q "HTTP 404" "$work/err"; then
+              meta=null
+            else
+              cat "$work/err" >&2
+              echo "::error::Could not read the README of $repo."
+              exit 1
+            fi
+            jq --arg repo "$repo" --argjson meta "$meta" '.[$repo] = $meta' \
+              "$work/readmes.json" > "$work/readmes.tmp"
+            mv "$work/readmes.tmp" "$work/readmes.json"
+          done < <(jq -r '.[].repo' "$work/candidates.json")
+
+          # What an earlier proposal on the update branch was already checked
+          # against, if there is one.
+          gh auth setup-git
+          echo 'null' > "$work/pending.json"
+          rc=0
+          git -C site ls-remote --exit-code --heads origin "$UPDATE_BRANCH" > /dev/null || rc=$?
+          if [ "$rc" -eq 0 ]; then
+            git -C site fetch --quiet --depth=1 origin "$UPDATE_BRANCH"
+            git -C site show "FETCH_HEAD:$STATE_FILE" > "$work/pending.json" 2> /dev/null ||
+              echo 'null' > "$work/pending.json"
+          elif [ "$rc" -ne 2 ]; then
+            echo "::error::Could not list the branches of $PORTFOLIO_REPO."
+            exit 1
+          fi
+
+          python3 automation/portfolio/plan.py decide \
+            --candidates "$work/candidates.json" \
+            --readmes "$work/readmes.json" \
+            --state "site/$STATE_FILE" \
+            --pending "$work/pending.json" \
+            --force "$FORCE" \
+            --page "$PORTFOLIO_PAGE" \
+            --portfolio-repo "$PORTFOLIO_REPO" \
+            --sources "$SOURCES_DIR" \
+            --manifest "$work/manifest.json" \
+            --new-state "$work/state.json" \
+            --summary "$GITHUB_STEP_SUMMARY" > "$work/decision"
+          cat "$work/decision"
+
+          go=false
+          if grep -qx 'run=true' "$work/decision"; then
+            if [ "$PLAN_ONLY" = "true" ]; then
+              echo "_Plan only: Claude was not run._" >> "$GITHUB_STEP_SUMMARY"
+            else
+              go=true
+            fi
+          fi
+          echo "go=$go" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch the repositories to read
+        if: steps.plan.outputs.go == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.REPOS_TOKEN }}
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/portfolio"
+          gh auth setup-git
+          mkdir -p "site/$SOURCES_DIR"
+          cp "$work/manifest.json" "site/$SOURCES_DIR/manifest.json"
+
+          while IFS=$'\t' read -r repo name branch; do
+            dest="site/$SOURCES_DIR/$name"
+            git clone --quiet --depth 1 --branch "$branch" "https://github.com/$repo.git" "$dest"
+            # Claude gets the files, not the history, and none of the
+            # repository's own Claude instructions or settings.
+            rm -rf "$dest/.git"
+            find "$dest" -depth \( -name .claude -o -name CLAUDE.md -o -name CLAUDE.local.md \) \
+              -exec rm -rf {} +
+          done < <(jq -r '.projects[] | select(.status == "check")
+                          | [.repo, .name, .default_branch] | @tsv' "$work/manifest.json")
+
+      - name: Install Claude Code
+        if: steps.plan.outputs.go == 'true'
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Let Claude update the page
+        if: steps.plan.outputs.go == 'true'
+        working-directory: site
+        env:
+          # The only credentials this step can see are Claude's own.
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          CLAUDE_MODEL: ${{ vars.CLAUDE_MODEL || 'claude-opus-5-5' }}
+          MAX_BUDGET_USD: ${{ vars.PORTFOLIO_MAX_BUDGET_USD || '3' }}
+        run: |
+          set -euo pipefail
+          [ -n "${ANTHROPIC_API_KEY:-}" ] || unset ANTHROPIC_API_KEY
+          [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] || unset CLAUDE_CODE_OAUTH_TOKEN
+          month=$(LC_ALL=C date -u +"%B %Y")
+
+          # Claude gets file reading/searching plus edits to the one page and
+          # nothing else: no shell, no network tools, no MCP servers, and none
+          # of the repositories' own Claude settings or hooks.
+          rc=0
+          sed -e "s|{{PAGE}}|$PORTFOLIO_PAGE|g" \
+              -e "s|{{SOURCES}}|$SOURCES_DIR|g" \
+              -e "s|{{MONTH}}|$month|g" \
+              "$GITHUB_WORKSPACE/automation/portfolio/prompt.md" |
+            claude -p \
+              --restricted \
+              --strict-mcp-config \
+              --tools "Read,Glob,Grep,Edit,Write" \
+              --allowedTools "Edit(/$PORTFOLIO_PAGE)" \
+              --permission-mode dontAsk \
+              --model "$CLAUDE_MODEL" \
+              --max-budget-usd "$MAX_BUDGET_USD" \
+              --output-format json > "$RUNNER_TEMP/claude.json" || rc=$?
+
+          cost=$(jq -r '.total_cost_usd // empty' "$RUNNER_TEMP/claude.json" 2> /dev/null || true)
+          cost="${cost:-n/a}"
+          echo "Cost of this run: \$$cost"
+          echo "Claude run: \$$cost" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$rc" -ne 0 ] || ! jq -e '.is_error != true' "$RUNNER_TEMP/claude.json" > /dev/null; then
+            detail=$(jq -r '.result // .subtype // "no details"' "$RUNNER_TEMP/claude.json" 2> /dev/null | head -c 2000 || true)
+            echo "::error::Claude did not finish (exit code $rc): ${detail:-no output}"
+            exit 1
+          fi
+          jq -r '.result // ""' "$RUNNER_TEMP/claude.json" | head -c 60000 > "$RUNNER_TEMP/summary.md"
+
+      - name: Check the edited page
+        if: steps.plan.outputs.go == 'true'
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/portfolio"
+          git -C site show "HEAD:$PORTFOLIO_PAGE" > "$work/before.html"
+
+          # Nothing but the page may have changed.
+          other=$(git -C site status --porcelain --untracked-files=all |
+            grep -v -e " $PORTFOLIO_PAGE\$" -e " $SOURCES_DIR/" || true)
+          if [ -n "$other" ]; then
+            echo "::error::Files other than $PORTFOLIO_PAGE were changed:"
+            echo "$other"
+            exit 1
+          fi
+
+          python3 automation/portfolio/check.py \
+            --before "$work/before.html" \
+            --after "site/$PORTFOLIO_PAGE" \
+            --manifest "$work/manifest.json"
+
+      - name: Open or update the pull request
+        if: steps.plan.outputs.go == 'true'
+        working-directory: site
+        env:
+          GH_TOKEN: ${{ secrets.REPOS_TOKEN }}
+          BASE: ${{ steps.plan.outputs.base }}
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/portfolio"
+
+          # Only the page and the record of what it was checked against are
+          # ever staged, whatever else is in the checkout.
+          cp "$work/state.json" "$STATE_FILE"
+          git add -- "$PORTFOLIO_PAGE" "$STATE_FILE"
+          page_changed=true
+          if git diff --cached --quiet -- "$PORTFOLIO_PAGE"; then
+            page_changed=false
+          fi
+
+          if [ "$DRY_RUN" = "true" ]; then
+            {
+              echo "### Proposed change to \`$PORTFOLIO_PAGE\` (dry run)"
+              echo
+              cat "$RUNNER_TEMP/summary.md"
+              echo
+              echo '````diff'
+              git diff --cached -- "$PORTFOLIO_PAGE"
+              echo '````'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if git diff --cached --quiet; then
+            echo "The page and its record are already up to date." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout --quiet -B "$UPDATE_BRANCH"
+          if [ "$page_changed" = "true" ]; then
+            git commit --quiet -m "$PR_TITLE"
+          else
+            git commit --quiet -m "Record the READMEs the portfolio was checked against"
+          fi
+          gh auth setup-git
+          # The branch belongs to this workflow; each run replaces it with one
+          # commit on top of the current default branch. It is also the
+          # workflow's memory: the next run reads the record from it and does
+          # not repeat a check for the same READMEs.
+          git push --quiet --force origin "$UPDATE_BRANCH"
+
+          pr=$(gh api -X GET "repos/$PORTFOLIO_REPO/pulls" \
+            -f state=open -f head="${PORTFOLIO_REPO%%/*}:$UPDATE_BRANCH" -f base="$BASE" \
+            --jq '.[0].number // empty')
+
+          if [ "$page_changed" != "true" ]; then
+            # Claude found nothing to change. The record is on the branch, so
+            # these READMEs are not checked again; no pull request is needed.
+            {
+              echo "The READMEs changed, but the page needed no change."
+              echo
+              cat "$RUNNER_TEMP/summary.md"
+            } >> "$GITHUB_STEP_SUMMARY"
+            if [ -n "$pr" ]; then
+              {
+                echo "The latest check found that the page needs no change for the current READMEs."
+                echo "This pull request now only holds the workflow's record and can be closed."
+              } > "$RUNNER_TEMP/pr-body.md"
+              gh api -X PATCH "repos/$PORTFOLIO_REPO/pulls/$pr" \
+                -F body=@"$RUNNER_TEMP/pr-body.md" --jq '.html_url' >> "$GITHUB_STEP_SUMMARY"
+            fi
+            exit 0
+          fi
+
+          {
+            cat "$RUNNER_TEMP/summary.md"
+            echo
+            echo "---"
+            echo "_Proposed automatically by the weekly portfolio auto-update workflow. Review before merging: the page goes live when this is merged. Closing this PR declines it, as long as the \`$UPDATE_BRANCH\` branch is kept; a new one is only proposed after a README changes again._"
+          } > "$RUNNER_TEMP/pr-body.md"
+
+          if [ -n "$pr" ]; then
+            url=$(gh api -X PATCH "repos/$PORTFOLIO_REPO/pulls/$pr" \
+              -F body=@"$RUNNER_TEMP/pr-body.md" --jq '.html_url')
+            echo "Updated $url" >> "$GITHUB_STEP_SUMMARY"
+          else
+            url=$(gh api -X POST "repos/$PORTFOLIO_REPO/pulls" \
+              -f title="$PR_TITLE" -f head="$UPDATE_BRANCH" -f base="$BASE" \
+              -F body=@"$RUNNER_TEMP/pr-body.md" --jq '.html_url')
+            echo "Opened $url" >> "$GITHUB_STEP_SUMMARY"
+          fi

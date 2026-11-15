@@ -77,6 +77,69 @@ To change the schedule, edit the `cron` line in
 - Only the README is ever committed, and changes always arrive as a pull
   request you review.
 
+## Portfolio auto-update
+
+A second workflow,
+[`portfolio-autoupdate.yml`](.github/workflows/portfolio-autoupdate.yml), keeps
+a public portfolio page in step with the same repositories. It runs on Mondays
+at 06:47 UTC, after the README check, and uses the same secrets.
+
+1. **Find what changed.** Lists the repositories that may appear on the page
+   and compares the current version of each README with the version the page
+   was last checked against. If nothing changed, the run ends here: Claude is
+   not started and nothing is spent.
+2. **Let Claude update the page.** Claude Code gets a copy of each repository
+   whose README changed, or that is new, and edits the one page: it corrects
+   existing entries, adds an entry for a new project that is worth showing, and
+   removes the entry of a repository that is gone. Entries of unchanged
+   repositories are left alone.
+3. **Check the edit.** [`portfolio/check.py`](portfolio/check.py) rejects the
+   edit if it touches the design, adds scripts, images or links to other
+   sites, drops a project, changes an entry whose README did not change, or
+   links to a private repository.
+4. **Propose the change.** The page is pushed to a `portfolio-autoupdate`
+   branch in the portfolio repository and a pull request is opened. The page
+   goes live only when you merge it.
+
+The record of which README versions the page was checked against is the file
+`.portfolio-sources.json` in the portfolio repository. It travels with the
+proposal, so a proposal is not repeated: while the `portfolio-autoupdate`
+branch holds the record for the current READMEs (pull request open, or closed
+by you with the branch kept), the next runs do nothing. When Claude finds that
+changed READMEs need no change on the page, only the record is pushed to that
+branch and no pull request is opened.
+
+Which repositories may appear: the ones you own that are not forks, archived
+or empty, and that have a README. The page is public, so a private repository
+is only described when you name it in `PORTFOLIO_PRIVATE_REPOS`, and it is
+never linked. To keep a single repository off the page, add the topic
+`no-portfolio` to it.
+
+Manual run inputs:
+
+| Input | Default | Meaning |
+| - | - | - |
+| `plan_only` | `false` | Only list what would be checked. Claude is not run. |
+| `dry_run` | `false` | Show the proposed diff in the run summary; push nothing, open no PR. |
+| `force` | `false` | Recheck every project, even if no README changed. |
+
+Repository variables:
+
+| Variable | Default | Meaning |
+| - | - | - |
+| `PORTFOLIO_REPO` | `<you>/portfolio-html` | Repository that holds the page. |
+| `PORTFOLIO_PAGE` | `docs/index.html` | Path of the page in it. |
+| `PORTFOLIO_PRIVATE_REPOS` | `readme-autoupdate` | Private repositories that may be described; `none` for none. |
+| `PORTFOLIO_EXCLUDE_REPOS` | `test` | Repositories that never appear. |
+| `PORTFOLIO_MAX_BUDGET_USD` | `3` | The most one run may spend on Claude. |
+| `CLAUDE_MODEL` | `claude-opus-5-5` | Shared with the README workflow. |
+
+`REPOS_TOKEN` must be able to read your repositories and to push a branch and
+open a pull request in the portfolio repository. Claude runs under the same
+limits as in the README workflow: it can read and search files and edit the
+one page, and the step that runs it only has the Claude credential. To change
+what Claude is asked to do, edit [`portfolio/prompt.md`](portfolio/prompt.md).
+
 ## Notes
 
 - Only repositories owned by your user account are covered, not organization
