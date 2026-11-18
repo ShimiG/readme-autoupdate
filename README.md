@@ -156,7 +156,7 @@ Repository variables:
 | `PORTFOLIO_PRIVATE_REPOS` | `readme-autoupdate` | Private repositories that may be described; `none` for none. |
 | `PORTFOLIO_EXCLUDE_REPOS` | `test` | Repositories that never appear. |
 | `PORTFOLIO_MAX_BUDGET_USD` | `3` | The most one run may spend on Claude. |
-| `CLAUDE_MODEL` | `claude-opus-5-5` | Shared with the README workflow. |
+| `CLAUDE_MODEL` | `claude-sonnet-5-5` | Shared with the README workflow. |
 
 `REPOS_TOKEN` must be able to read your repositories and to push a branch and
 open a pull request in the portfolio repository. Claude runs under the same

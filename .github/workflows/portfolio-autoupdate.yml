@@ -19,7 +19,7 @@ name: Portfolio auto-update
 #                             page (default: readme-autoupdate; `none` for none).
 #   PORTFOLIO_EXCLUDE_REPOS   Repos that never appear (default: test).
 #   PORTFOLIO_MAX_BUDGET_USD  Most one run may spend on Claude (default: 3).
-#   CLAUDE_MODEL              Model to use (default: claude-opus-5-5).
+#   CLAUDE_MODEL              Model to use (default: claude-sonnet-5-5).
 
 on:
   schedule:
@@ -230,7 +230,7 @@ jobs:
           # The only credentials this step can see are Claude's own.
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          CLAUDE_MODEL: ${{ vars.CLAUDE_MODEL || 'claude-opus-5-5' }}
+          CLAUDE_MODEL: ${{ vars.CLAUDE_MODEL || 'claude-sonnet-5-5' }}
           MAX_BUDGET_USD: ${{ vars.PORTFOLIO_MAX_BUDGET_USD || '3' }}
         run: |
           set -euo pipefail
