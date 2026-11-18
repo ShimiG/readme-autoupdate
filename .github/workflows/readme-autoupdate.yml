@@ -11,6 +11,7 @@ name: README auto-update
 #
 # Optional repository variables:
 #   CLAUDE_MODEL             Model to use (default: claude-opus-5-5).
+#   CLAUDE_EFFORT            Effort level: low, medium, high (default: low).
 #   EXCLUDE_REPOS            Comma-separated repos to skip (owner/name or name).
 
 on:
@@ -30,6 +31,10 @@ on:
         description: "Show the proposed README diff in the run summary; don't push or open PRs."
         type: boolean
         default: false
+      force:
+        description: "Review the whole repository again even if nothing changed since the last review."
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -42,6 +47,9 @@ env:
   # Branch the proposed README change is pushed to in each repository.
   UPDATE_BRANCH: readme-autoupdate
   PR_TITLE: "docs: update README to match the current code"
+  # Hidden ref in each repository that remembers the last commit whose README
+  # was reviewed, so unchanged code is never reviewed twice.
+  MARKER_REF: refs/readme-autoupdate/reviewed
 
 jobs:
   discover:
@@ -75,6 +83,7 @@ jobs:
           ONLY_REPOS: ${{ inputs.repos }}
           LOOKBACK_DAYS: ${{ inputs.lookback_days || '8' }}
           EXCLUDE_REPOS: ${{ vars.EXCLUDE_REPOS }}
+          FORCE: ${{ inputs.force || 'false' }}
         run: |
           set -euo pipefail
 
@@ -115,7 +124,25 @@ jobs:
                     )
                   | {repo: .full_name, branch: .default_branch}
                 )
-            ' > repos.json
+            ' > candidates.json
+
+          # Drop every repository whose default branch is still at the commit
+          # that was reviewed last time: no job, no Claude run, no tokens.
+          gh auth setup-git
+          : > todo.jsonl
+          : > unchanged.txt
+          while IFS=$'\t' read -r repo branch; do
+            refs=$(git ls-remote "https://github.com/$repo.git" "refs/heads/$branch" "$MARKER_REF" 2>/dev/null || true)
+            head=$(awk -v ref="refs/heads/$branch" '$2 == ref { print $1 }' <<< "$refs")
+            marker=$(awk -v ref="$MARKER_REF" '$2 == ref { print $1 }' <<< "$refs")
+            if [ "$FORCE" != "true" ] && [ -n "$head" ] && [ "$head" = "$marker" ]; then
+              echo "$repo" >> unchanged.txt
+              continue
+            fi
+            jq -cn --arg repo "$repo" --arg branch "$branch" \
+              '{repo: $repo, branch: $branch}' >> todo.jsonl
+          done < <(jq -r '.[] | [.repo, .branch] | @tsv' candidates.json)
+          jq -cs '.' todo.jsonl > repos.json
 
           count=$(jq 'length' repos.json)
           if [ "$count" -gt 256 ]; then
@@ -130,6 +157,10 @@ jobs:
           {
             echo "### Repositories to check: $count"
             jq -r '.[] | "- `\(.repo)` (`\(.branch)`)"' repos.json
+            if [ -s unchanged.txt ]; then
+              echo
+              echo "Unchanged since the last review, skipped: $(sed 's/.*/`&`/' unchanged.txt | paste -sd ' ')"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
   update:
@@ -145,12 +176,15 @@ jobs:
     env:
       REPO: ${{ matrix.repo }}
       DEFAULT_BRANCH: ${{ matrix.branch }}
+      # A diff larger than this is not pasted into the prompt; Claude gets the
+      # list of changed files and opens the ones that matter.
+      MAX_DIFF_CHARS: "60000"
     steps:
-      - name: Check out the prompt
+      - name: Check out the prompts
         uses: actions/checkout@v6
         with:
           path: automation
-          sparse-checkout: prompt.md
+          sparse-checkout: /prompt*.md
           sparse-checkout-cone-mode: false
           persist-credentials: false
 
@@ -164,11 +198,12 @@ jobs:
           # Keep the token out of the checkout Claude reads.
           persist-credentials: false
 
-      - name: Locate README and check for a pending proposal
+      - name: Locate README and decide how much to review
         id: prep
         working-directory: target
         env:
           GH_TOKEN: ${{ secrets.REPOS_TOKEN }}
+          FORCE: ${{ inputs.force || 'false' }}
         run: |
           set -euo pipefail
 
@@ -191,60 +226,132 @@ jobs:
           esac
           echo "readme=$readme" >> "$GITHUB_OUTPUT"
 
-          # If the update branch already contains the current default-branch
-          # commit, a proposal for this exact code is open (or was closed by
-          # the owner). Don't redo it until the default branch moves.
+          echo "head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+          # Changes to these never make a README wrong: the README itself and
+          # dependency lock files.
+          ignored=(":(exclude)$readme")
+          for lock in package-lock.json npm-shrinkwrap.json yarn.lock pnpm-lock.yaml \
+            bun.lock bun.lockb poetry.lock uv.lock Pipfile.lock Cargo.lock \
+            Gemfile.lock composer.lock go.sum flake.lock; do
+            ignored+=(":(exclude,glob)**/$lock")
+          done
+
           gh auth setup-git
-          skip=false
-          if git ls-remote --exit-code --heads origin "$UPDATE_BRANCH" >/dev/null 2>&1; then
-            git fetch --quiet --depth=50 origin "$UPDATE_BRANCH"
-            if git merge-base --is-ancestor HEAD FETCH_HEAD 2>/dev/null; then
-              skip=true
-              echo "⏭️ \`$REPO\`: a README proposal for the current \`$DEFAULT_BRANCH\` already exists on \`$UPDATE_BRANCH\`." >> "$GITHUB_STEP_SUMMARY"
+
+          # full       - Claude reviews the whole repository (first review,
+          #               forced, or an earlier proposal is still open).
+          # incremental - Claude only gets what changed since the last review.
+          # skip        - nothing to review; Claude is not started.
+          mode=full
+          if [ "$FORCE" = "true" ]; then
+            :
+          elif git ls-remote --exit-code --heads origin "$UPDATE_BRANCH" >/dev/null 2>&1 &&
+            git fetch --quiet --depth=50 origin "$UPDATE_BRANCH" &&
+            git merge-base --is-ancestor HEAD FETCH_HEAD 2>/dev/null; then
+            # The update branch already contains the current default-branch
+            # commit: a proposal for this exact code is open, or was closed by
+            # the owner. Don't redo it until the default branch moves.
+            mode=skip
+            echo "⏭️ \`$REPO\`: a README proposal for the current \`$DEFAULT_BRANCH\` already exists on \`$UPDATE_BRANCH\`." >> "$GITHUB_STEP_SUMMARY"
+          elif git fetch --quiet --depth=1 origin "$MARKER_REF" 2>/dev/null; then
+            # This repository was reviewed before, at the commit the marker
+            # points to.
+            base=$(git rev-parse FETCH_HEAD)
+            echo "base=${base:0:10}" >> "$GITHUB_OUTPUT"
+            if git diff --quiet "$base" HEAD -- . "${ignored[@]}"; then
+              mode=skip
+              echo "⏭️ \`$REPO\`: only the README or lock files changed since the last review." >> "$GITHUB_STEP_SUMMARY"
+            elif [ "$(gh api -X GET "repos/$REPO/pulls" -f state=open \
+              -f head="${REPO%%/*}:$UPDATE_BRANCH" --jq 'length' 2>/dev/null || echo unknown)" != "0" ]; then
+              # An earlier proposal is still open and the code moved on: redo
+              # the proposal against the whole repository.
+              :
+            else
+              mode=incremental
+              patch=$(git diff --no-color --unified=2 "$base" HEAD -- . "${ignored[@]}")
+              {
+                echo "<changes>"
+                echo "Files changed since commit ${base:0:10}:"
+                echo
+                git diff --no-color --stat=100 --stat-count=150 "$base" HEAD -- . "${ignored[@]}"
+                echo
+                if [ "${#patch}" -le "$MAX_DIFF_CHARS" ]; then
+                  echo "The diff:"
+                  echo
+                  printf '%s\n' "$patch"
+                else
+                  echo "The diff is too large to include (${#patch} characters). Open the changed files that could matter for the README."
+                fi
+                echo "</changes>"
+                echo
+              } > "$RUNNER_TEMP/changes.md"
             fi
           fi
-          echo "skip=$skip" >> "$GITHUB_OUTPUT"
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
 
       - name: Install Claude Code
-        if: steps.prep.outputs.skip != 'true'
+        if: steps.prep.outputs.mode != 'skip'
         run: npm install -g @anthropic-ai/claude-code
 
       - name: Let Claude review the code and update the README
-        if: steps.prep.outputs.skip != 'true'
+        if: steps.prep.outputs.mode != 'skip'
         working-directory: target
         env:
           # The only credentials this step can see are Claude's own.
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           CLAUDE_MODEL: ${{ vars.CLAUDE_MODEL || 'claude-opus-5-5' }}
+          CLAUDE_EFFORT: ${{ vars.CLAUDE_EFFORT || 'low' }}
           README_PATH: ${{ steps.prep.outputs.readme }}
+          MODE: ${{ steps.prep.outputs.mode }}
+          BASE: ${{ steps.prep.outputs.base }}
         run: |
           set -euo pipefail
           [ -n "${ANTHROPIC_API_KEY:-}" ] || unset ANTHROPIC_API_KEY
           [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] || unset CLAUDE_CODE_OAUTH_TOKEN
 
+          # prompt.md holds the rules; its {{SCOPE}} line is replaced by what
+          # this run should look at. An incremental review starts with the
+          # changes themselves, so Claude does not have to go and find them.
+          prompts="$GITHUB_WORKSPACE/automation"
+          {
+            if [ "$MODE" = "incremental" ]; then cat "$RUNNER_TEMP/changes.md"; fi
+            awk -v scope="$prompts/prompt-$MODE.md" '
+              $0 == "{{SCOPE}}" { while ((getline line < scope) > 0) print line; next }
+              { print }
+            ' "$prompts/prompt.md" |
+              sed -e "s|{{README_PATH}}|$README_PATH|g" -e "s|{{BASE}}|$BASE|g"
+          } > "$RUNNER_TEMP/prompt.txt"
+
           # Claude gets file reading/searching plus edits to the README and
           # nothing else: no shell, no network tools, no MCP servers, and none
           # of the target repository's own Claude settings or hooks.
-          sed "s|{{README_PATH}}|$README_PATH|g" "$GITHUB_WORKSPACE/automation/prompt.md" |
-            claude -p \
-              --restricted \
-              --strict-mcp-config \
-              --tools "Read,Glob,Grep,Edit,Write" \
-              --allowedTools "Edit(/$README_PATH)" \
-              --permission-mode dontAsk \
-              --model "$CLAUDE_MODEL" \
-              --output-format json > "$RUNNER_TEMP/claude.json"
+          claude -p \
+            --restricted \
+            --strict-mcp-config \
+            --exclude-dynamic-system-prompt-sections \
+            --tools "Read,Glob,Grep,Edit,Write" \
+            --allowedTools "Edit(/$README_PATH)" \
+            --permission-mode dontAsk \
+            --model "$CLAUDE_MODEL" \
+            --effort "$CLAUDE_EFFORT" \
+            --output-format json < "$RUNNER_TEMP/prompt.txt" > "$RUNNER_TEMP/claude.json"
 
           jq -e '.is_error != true' "$RUNNER_TEMP/claude.json" >/dev/null || {
             echo "::error::Claude reported an error: $(jq -r '.result // "unknown"' "$RUNNER_TEMP/claude.json")"
             exit 1
           }
           jq -r '.result // ""' "$RUNNER_TEMP/claude.json" | head -c 60000 > "$RUNNER_TEMP/summary.md"
-          echo "Cost of this run: \$$(jq -r '.total_cost_usd // "n/a"' "$RUNNER_TEMP/claude.json")"
+          usage=$(jq -r '
+            [.modelUsage[]?] as $m
+            | "\([$m[] | .inputTokens + .cacheCreationInputTokens + .cacheReadInputTokens] | add // 0) input tokens (\([$m[] | .cacheReadInputTokens] | add // 0) read from cache), \([$m[] | .outputTokens] | add // 0) output tokens, $\(.total_cost_usd // "n/a")"
+          ' "$RUNNER_TEMP/claude.json")
+          echo "$MODE review: $usage"
+          echo "🔎 \`$REPO\`: $MODE review, $usage" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Open or update the pull request
-        if: steps.prep.outputs.skip != 'true'
+        if: steps.prep.outputs.mode != 'skip'
         working-directory: target
         env:
           GH_TOKEN: ${{ secrets.REPOS_TOKEN }}
@@ -302,3 +409,16 @@ jobs:
               -F body=@"$RUNNER_TEMP/pr-body.md" --jq '.html_url')
             echo "📝 \`$REPO\`: opened $url" >> "$GITHUB_STEP_SUMMARY"
           fi
+
+      - name: Remember the reviewed commit
+        if: ${{ !inputs.dry_run }}
+        working-directory: target
+        env:
+          GH_TOKEN: ${{ secrets.REPOS_TOKEN }}
+          HEAD_SHA: ${{ steps.prep.outputs.head }}
+        run: |
+          # Next time this commit is not reviewed again, and later commits are
+          # reviewed as a diff against it.
+          gh auth setup-git
+          git push --quiet --force origin "$HEAD_SHA:$MARKER_REF" ||
+            echo "::warning::Could not record the reviewed commit in $REPO; it will be reviewed in full again next time."

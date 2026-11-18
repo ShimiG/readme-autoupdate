@@ -8,19 +8,39 @@ wherever the README no longer describes the project.
 
 1. **Find repositories.** Lists the repositories your account owns, skipping
    forks, archived and empty repositories. On the weekly schedule only
-   repositories pushed to in the last 8 days are checked, so unchanged projects
-   cost nothing.
-2. **Review each one.** For every repository (three at a time), Claude Code
-   reads the code and edits the README only where it is wrong or incomplete. If
-   there is no README, it writes one.
+   repositories pushed to in the last 8 days are considered, and of those every
+   repository whose default branch is still at the commit reviewed last time is
+   dropped, so unchanged projects cost nothing.
+2. **Review each one.** For every remaining repository (three at a time),
+   Claude Code edits the README only where it is wrong or incomplete. If there
+   is no README, it writes one. How much Claude reads depends on what happened
+   since the last review (see below).
 3. **Propose the change.** If the README changed, the workflow pushes a single
    commit to a `readme-autoupdate` branch in that repository and opens a pull
    request describing what changed and why. Nothing is merged for you.
+4. **Remember the commit.** The reviewed commit is recorded in the repository
+   as the hidden ref `refs/readme-autoupdate/reviewed`. It is not a branch or a
+   tag and does not show up on GitHub.
 
 A proposal is not repeated: while the `readme-autoupdate` branch is based on the
 current default-branch commit (PR still open, or closed by you), the repository
 is skipped. After the default branch moves, the next run replaces the branch
 with a fresh proposal.
+
+### Keeping token use low
+
+Almost all of the cost of a review is the files Claude reads, so the workflow
+gives it as little to read as it can:
+
+| Since the last review | What runs | What Claude reads |
+| - | - | - |
+| Nothing changed | No job, Claude is not started | Nothing |
+| Only the README or dependency lock files changed (for example, you merged the proposal) | Claude is not started | Nothing |
+| Code changed | Incremental review | The diff since the reviewed commit and the README; other files only if the diff is not enough. A diff over 60,000 characters is replaced by the list of changed files. |
+| Never reviewed, an earlier proposal is still open, or `force` is set | Full review | The README and the code it depends on |
+
+Each review prints its token count and cost in the job log and in the run
+summary.
 
 ## Setup
 
@@ -51,13 +71,15 @@ Manual run inputs:
 | - | - | - |
 | `repos` | empty | Only these repositories (comma-separated `owner/name` or `name`). |
 | `lookback_days` | `8` | Only repositories pushed to in the last N days; `0` checks all of them. |
-| `dry_run` | `false` | Show proposed diffs in the run summary; push nothing, open no PRs. |
+| `dry_run` | `false` | Show proposed diffs in the run summary; push nothing, open no PRs, and do not record the commit as reviewed. |
+| `force` | `false` | Review the whole repository again even if nothing changed since the last review, for example after editing the prompts. |
 
 Repository variables (Settings → Secrets and variables → Actions → Variables):
 
 | Variable | Default | Meaning |
 | - | - | - |
-| `CLAUDE_MODEL` | `claude-opus-5-5` | Model Claude Code uses. |
+| `CLAUDE_MODEL` | `claude-opus-5-5` | Model Claude Code uses. A smaller model is the biggest single cost lever: the same tokens cost about half on `claude-sonnet-5-5` and far less on `claude-haiku-5-5`, at some loss of care. |
+| `CLAUDE_EFFORT` | `low` | How hard the model works (`low`, `medium`, `high`). Higher levels read and think more and cost more. |
 | `EXCLUDE_REPOS` | empty | Comma-separated repositories to never touch. |
 
 To opt a single repository out, add the topic `no-readme-autoupdate` to it.
@@ -65,7 +87,9 @@ To opt a single repository out, add the topic `no-readme-autoupdate` to it.
 To change the schedule, edit the `cron` line in
 [`.github/workflows/readme-autoupdate.yml`](.github/workflows/readme-autoupdate.yml)
 (default: Mondays 05:17 UTC). To change what Claude is asked to do, edit
-[`prompt.md`](prompt.md).
+[`prompt.md`](prompt.md) (the rules), [`prompt-full.md`](prompt-full.md) (what
+to read in a full review) or [`prompt-incremental.md`](prompt-incremental.md)
+(what to do with a diff).
 
 ## Safety
 
@@ -146,5 +170,7 @@ what Claude is asked to do, edit [`portfolio/prompt.md`](portfolio/prompt.md).
   repositories you created.
 - If this repository is public, GitHub pauses scheduled workflows after 60 days
   without repository activity; re-enable it from the Actions tab.
-- Each repository checked is one Claude Code run, billed to your API key or
-  counted against your subscription; the cost of each run is printed in its log.
+- Each repository reviewed is one Claude Code run, billed to your API key or
+  counted against your subscription; skipped repositories use no tokens.
+- To make a repository start over with a full review, run the workflow by hand
+  for it with `force` ticked.
