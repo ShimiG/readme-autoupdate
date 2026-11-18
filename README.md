@@ -78,7 +78,7 @@ Repository variables (Settings → Secrets and variables → Actions → Variabl
 
 | Variable | Default | Meaning |
 | - | - | - |
-| `CLAUDE_MODEL` | `claude-opus-5-5` | Model Claude Code uses. A smaller model is the biggest single cost lever: the same tokens cost about half on `claude-sonnet-5-5` and far less on `claude-haiku-5-5`, at some loss of care. |
+| `CLAUDE_MODEL` | `claude-sonnet-5-5` | Model Claude Code uses. `claude-opus-5-5` is more careful at about twice the price; `claude-haiku-5-5` is far cheaper and less careful. Setting this variable also changes the model of the portfolio workflow. |
 | `CLAUDE_EFFORT` | `low` | How hard the model works (`low`, `medium`, `high`). Higher levels read and think more and cost more. |
 | `EXCLUDE_REPOS` | empty | Comma-separated repositories to never touch. |
 

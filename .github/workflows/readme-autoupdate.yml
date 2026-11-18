@@ -10,7 +10,7 @@ name: README auto-update
 #   CLAUDE_CODE_OAUTH_TOKEN  a Claude subscription token from `claude setup-token`.
 #
 # Optional repository variables:
-#   CLAUDE_MODEL             Model to use (default: claude-opus-5-5).
+#   CLAUDE_MODEL             Model to use (default: claude-sonnet-5-5).
 #   CLAUDE_EFFORT            Effort level: low, medium, high (default: low).
 #   EXCLUDE_REPOS            Comma-separated repos to skip (owner/name or name).
 
@@ -301,7 +301,7 @@ jobs:
           # The only credentials this step can see are Claude's own.
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          CLAUDE_MODEL: ${{ vars.CLAUDE_MODEL || 'claude-opus-5-5' }}
+          CLAUDE_MODEL: ${{ vars.CLAUDE_MODEL || 'claude-sonnet-5-5' }}
           CLAUDE_EFFORT: ${{ vars.CLAUDE_EFFORT || 'low' }}
           README_PATH: ${{ steps.prep.outputs.readme }}
           MODE: ${{ steps.prep.outputs.mode }}
